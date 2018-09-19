@@ -100,7 +100,13 @@ def safe_embedding_lookup_sparse(embedding_weights,
     logging.warn("The default value of combiner will change from \"mean\" "
                  "to \"sqrtn\" after 2016/11/01.")
     combiner = "mean"
-  if embedding_weights is None or len(embedding_weights) < 1:
+  if embedding_weights is None:
+    raise ValueError("Missing embedding_weights %s." % embedding_weights)
+  if isinstance(embedding_weights, variables.PartitionedVariable):
+    embedding_weights = list(embedding_weights)  # get underlying Variables.
+  if not isinstance(embedding_weights, list):
+    embedding_weights = [embedding_weights]
+  if len(embedding_weights) < 1:
     raise ValueError("Missing embedding_weights %s." % embedding_weights)
 
   dtype = sparse_weights.dtype if sparse_weights is not None else None
@@ -134,6 +140,9 @@ def safe_embedding_lookup_sparse(embedding_weights,
 
     # Prune invalid ids and weights.
     sparse_ids, sparse_weights = _prune_invalid_ids(sparse_ids, sparse_weights)
+    if combiner != "sum":
+      sparse_ids, sparse_weights = _prune_invalid_weights(
+          sparse_ids, sparse_weights)
 
     # Fill in dummy values for empty features, if necessary.
     sparse_ids, is_row_empty = sparse_ops.sparse_fill_empty_rows(sparse_ids,
@@ -182,10 +191,20 @@ def _prune_invalid_ids(sparse_ids, sparse_weights):
   is_id_valid = math_ops.greater_equal(sparse_ids.values, 0)
   if sparse_weights is not None:
     is_id_valid = math_ops.logical_and(
-        is_id_valid, math_ops.greater(sparse_weights.values, 0))
+        is_id_valid,
+        array_ops.ones_like(sparse_weights.values, dtype=dtypes.bool))
   sparse_ids = sparse_ops.sparse_retain(sparse_ids, is_id_valid)
   if sparse_weights is not None:
     sparse_weights = sparse_ops.sparse_retain(sparse_weights, is_id_valid)
+  return sparse_ids, sparse_weights
+
+
+def _prune_invalid_weights(sparse_ids, sparse_weights):
+  """Prune invalid weights (< 0) from the input ids and weights."""
+  if sparse_weights is not None:
+    is_weights_valid = math_ops.greater(sparse_weights.values, 0)
+    sparse_ids = sparse_ops.sparse_retain(sparse_ids, is_weights_valid)
+    sparse_weights = sparse_ops.sparse_retain(sparse_weights, is_weights_valid)
   return sparse_ids, sparse_weights
 
 
@@ -351,7 +370,7 @@ def _sampled_scattered_embedding_lookup(
     # No need to validate the indices since we have checked the params
     # dimensions and we know the largest id.
     result = embedding_ops.embedding_lookup(
-        params, ids, partition_strategy="div", validate_indices=False)
+        params, ids, partition_strategy="div")
 
     return array_ops.reshape(result,
                              array_ops.concat([values_shape, [dimension]], 0))
@@ -439,7 +458,7 @@ def scattered_embedding_lookup_sparse(params,
     return embeddings
 
 
-def embedding_lookup_unique(params, ids, name=None):
+def embedding_lookup_unique(params, ids, partition_strategy="mod", name=None):
   """Version of embedding_lookup that avoids duplicate lookups.
 
   This can save communication in the case of repeated ids.
@@ -451,6 +470,9 @@ def embedding_lookup_unique(params, ids, name=None):
       `PartitionedVariable`. Shape `[index, d1, d2, ...]`.
     ids: A one-dimensional `Tensor` with type `int32` or `int64` containing
       the ids to be looked up in `params`. Shape `[ids1, ids2, ...]`.
+    partition_strategy: A string specifying the partitioning strategy, relevant
+      if `len(params) > 1`. Currently `"div"` and `"mod"` are supported. Default
+      is `"mod"`.
     name: A name for this operation (optional).
 
   Returns:
@@ -464,9 +486,10 @@ def embedding_lookup_unique(params, ids, name=None):
     ids = ops.convert_to_tensor(ids)
     shape = array_ops.shape(ids)
     ids_flat = array_ops.reshape(
-        ids, math_ops.reduce_prod(shape, keep_dims=True))
+        ids, math_ops.reduce_prod(shape, keepdims=True))
     unique_ids, idx = array_ops.unique(ids_flat)
-    unique_embeddings = embedding_ops.embedding_lookup(params, unique_ids)
+    unique_embeddings = embedding_ops.embedding_lookup(params, unique_ids,
+                                                       partition_strategy)
     embeds_flat = array_ops.gather(unique_embeddings, idx)
     embed_shape = array_ops.concat(
         [shape, array_ops.shape(unique_embeddings)[1:]], 0)
@@ -681,19 +704,17 @@ def embedding_lookup_sparse_with_distributed_aggregation(
     return embeddings
 
 
-def _do_gather(params, ids, validate_indices=True, name=None):
+def _do_gather(params, ids, name=None):
   """Deals with doing gather differently for resource variables."""
   if isinstance(params, resource_variable_ops.ResourceVariable):
     return params.sparse_read(ids, name=name)
-  return array_ops.gather(
-      params, ids, name=name, validate_indices=validate_indices)
+  return array_ops.gather(params, ids, name=name)
 
 
 def _embedding_lookup_with_distributed_aggregation(params,
                                                    ids,
                                                    partition_strategy="mod",
                                                    name=None,
-                                                   validate_indices=True,
                                                    max_norm=None,
                                                    weights=None,
                                                    idx=None,
@@ -724,8 +745,7 @@ def _embedding_lookup_with_distributed_aggregation(params,
       params = ops.convert_n_to_tensor_or_indexed_slices(params, name="params")
     if np == 1:
       with ops.colocate_with(params[0]):
-        ret = maybe_normalize(
-            _do_gather(params[0], ids, validate_indices=validate_indices))
+        ret = maybe_normalize(_do_gather(params[0], ids))
         ignore_weights = weights is None
         if not ignore_weights:
           if weights.dtype != ret.dtype:
@@ -803,9 +823,7 @@ def _embedding_lookup_with_distributed_aggregation(params,
       partitioned_result = []
       for p in xrange(np):
         with ops.colocate_with(params[p]):
-          partitioned_result.append(
-              _do_gather(
-                  params[p], gather_ids[p], validate_indices=validate_indices))
+          partitioned_result.append(_do_gather(params[p], gather_ids[p]))
 
       ignore_weights = weights is None
       if not ignore_weights:
@@ -870,7 +888,7 @@ def _embedding_lookup_with_distributed_aggregation(params,
           p_segment_ids = array_ops.gather(segment_ids, pindices[p])
           # Number the p_segment_ids to meet segment_sum's requirements. Note
           # that unique_p_segment_ids contains unique segment ids of this
-          # partiton and these ids' order is unchanged.
+          # partition and these ids' order is unchanged.
           unique_p_segment_ids, unique_p_segment_idx = array_ops.unique(
               p_segment_ids)
           partitioned_segment_ids.append(unique_p_segment_ids)

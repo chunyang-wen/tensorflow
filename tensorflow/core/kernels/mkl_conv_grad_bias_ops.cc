@@ -18,6 +18,7 @@ limitations under the License.
 // bias.
 
 #ifdef INTEL_MKL
+#ifdef INTEL_MKL_ML_ONLY
 
 #define USE_EIGEN_TENSOR
 #define EIGEN_USE_THREADS
@@ -38,8 +39,10 @@ limitations under the License.
 #include "tensorflow/core/util/use_cudnn.h"
 #include "tensorflow/core/util/work_sharder.h"
 
-#include "third_party/mkl/include/mkl_dnn.h"
-#include "third_party/mkl/include/mkl_dnn_types.h"
+#ifdef INTEL_MKL_ML_ONLY
+#include "mkl_dnn.h"
+#include "mkl_dnn_types.h"
+#endif
 #include "tensorflow/core/util/mkl_util.h"
 
 namespace tensorflow {
@@ -79,15 +82,16 @@ class MklConv2DCustomBackpropBiasOp : public OpKernel {
     } else if (data_format_ == FORMAT_NHWC || data_format_ == FORMAT_NCHW) {
       mkl_context.c_size = GetTensorDim(input, data_format_, 'C');
     } else {
-      errors::InvalidArgument("Unknown format ",
-                              " Format must be either NCHW or NHWC. ");
+      context->CtxFailure(errors::InvalidArgument(
+          "Unknown format ", " Format must be either NCHW or NHWC. "));
+      return;
     }
     TensorShape output_shape{mkl_context.c_size};
 
     Tensor* bias_backprop = nullptr;
     MklShape output_mkl_shape;
     output_mkl_shape.SetMklTensor(false);
-    AllocateOutputSetMklshape(context, 0, &bias_backprop, output_shape,
+    AllocateOutputSetMklShape(context, 0, &bias_backprop, output_shape,
                               output_mkl_shape);
 
     mkl_context.in_dims = 4;
@@ -251,14 +255,15 @@ class MklConv2DCustomBackpropBiasOp : public OpKernel {
   TF_DISALLOW_COPY_AND_ASSIGN(MklConv2DCustomBackpropBiasOp);
 };
 
-#define REGISTER_CPU_KERNELS(T)                                           \
-  REGISTER_KERNEL_BUILDER(Name("MklConv2DWithBiasBackpropBias")           \
-                              .Device(DEVICE_CPU)                         \
-                              .TypeConstraint<T>("T")                     \
-                              .Label(mkl_layer_registry::kMklLayerLabel), \
+#define REGISTER_CPU_KERNELS(T)                                     \
+  REGISTER_KERNEL_BUILDER(Name("_MklConv2DWithBiasBackpropBias")    \
+                              .Device(DEVICE_CPU)                   \
+                              .TypeConstraint<T>("T")               \
+                              .Label(mkl_op_registry::kMklOpLabel), \
                           MklConv2DCustomBackpropBiasOp<CPUDevice, T>);
 
 TF_CALL_float(REGISTER_CPU_KERNELS);
 #undef REGISTER_CPU_KERNELS
 } /* namespace tensorflow */
+#endif /* INTEL_MKL_ML_ONLY */
 #endif /* INTEL_MKL */
